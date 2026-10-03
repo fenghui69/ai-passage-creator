@@ -1,9 +1,141 @@
 """图片相关数据模型"""
 
 import base64
-from typing import Optional
+import re
+from typing import List, Optional, Tuple
 from enum import Enum
 from pydantic import BaseModel, Field
+
+
+# MIME 类型与文件扩展名映射
+_EXTENSION_BY_MIME = {
+    "image/jpeg": ".jpg",
+    "image/jpg": ".jpg",
+    "image/png": ".png",
+    "image/gif": ".gif",
+    "image/webp": ".webp",
+    "image/bmp": ".bmp",
+    "image/x-icon": ".ico",
+    "image/vnd.microsoft.icon": ".ico",
+    "image/svg+xml": ".svg",
+}
+
+
+def extension_for_mime(mime_type: Optional[str]) -> str:
+    """根据 MIME 类型获取文件扩展名，未知类型回退 .png"""
+    if not mime_type:
+        return ".png"
+    return _EXTENSION_BY_MIME.get(mime_type.lower(), ".png")
+
+
+def sniff_image_mime_type(data: Optional[bytes]) -> Optional[str]:
+    """
+    根据文件头判断图片的真实 MIME 类型
+
+    图片 URL 往往无法反映真实格式（例如 Iconify 返回的 .svg 图标），
+    以字节内容为准才能避免 Content-Type 标错导致浏览器拒绝渲染。
+
+    Args:
+        data: 图片字节数据
+
+    Returns:
+        识别出的 MIME 类型，无法识别返回 None
+    """
+    if not data:
+        return None
+
+    if data.startswith(b"\x89PNG\r\n\x1a\n"):
+        return "image/png"
+    if data.startswith(b"\xff\xd8\xff"):
+        return "image/jpeg"
+    if data.startswith((b"GIF87a", b"GIF89a")):
+        return "image/gif"
+    if data[:4] == b"RIFF" and data[8:12] == b"WEBP":
+        return "image/webp"
+    if data.startswith(b"BM"):
+        return "image/bmp"
+    if data.startswith(b"\x00\x00\x01\x00"):
+        return "image/x-icon"
+
+    # SVG：可能是裸 <svg>、带 XML 声明，或带 UTF-8 BOM / 前导空白
+    head = data[:1024]
+    stripped = head.lstrip(b"\xef\xbb\xbf").lstrip()
+    if stripped[:4].lower() == b"<svg":
+        return "image/svg+xml"
+    if stripped[:5].lower() == b"<?xml" and b"<svg" in head.lower():
+        return "image/svg+xml"
+
+    return None
+
+
+# SVG 中可携带主动内容的元素（含 <script>、<foreignObject> 及各类嵌入标签）
+_SVG_DANGEROUS_ELEMENT = re.compile(
+    r"<\s*(script|foreignObject|iframe|embed|object)\b[^>]*?(?:/\s*>|>.*?</\s*\1\s*>)",
+    re.IGNORECASE | re.DOTALL,
+)
+# 兜底清理上一步遗漏的孤立/未闭合标签
+_SVG_LEFTOVER_TAG = re.compile(
+    r"<\s*/?\s*(script|foreignObject|iframe|embed|object)\b[^>]*>",
+    re.IGNORECASE,
+)
+# 事件属性，如 onload="..."、onclick='...'
+_SVG_EVENT_ATTRIBUTE = re.compile(
+    r"""\son[a-z]+\s*=\s*(?:"[^"]*"|'[^']*'|[^\s>]+)""",
+    re.IGNORECASE,
+)
+# 伪协议链接，如 href="javascript:..."
+_SVG_SCRIPT_URI = re.compile(
+    r"""((?:xlink:href|href|src)\s*=\s*)(["'])\s*(?:javascript|vbscript|data:text/html)[^"']*\2""",
+    re.IGNORECASE,
+)
+
+
+def sanitize_svg(data: Optional[bytes]) -> Tuple[Optional[bytes], List[str]]:
+    """
+    移除 SVG 中的主动内容（脚本、事件属性、伪协议链接）
+
+    SVG 直接访问时（而非通过 <img> 加载）其中携带的脚本会在托管域名下执行。
+    本项目的配图最终都渲染为 Markdown 的 `![](url)`，即 <img> 上下文，脚本本来
+    就不会执行；此处的清理属于纵深防御，用于覆盖「用户直接打开图片链接」的情况，
+    不替代对 SVG 来源的信任控制。
+
+    Args:
+        data: SVG 字节数据
+
+    Returns:
+        (清理后的字节, 被移除项的描述列表)。无需修改时原样返回且列表为空
+    """
+    if not data:
+        return data, []
+
+    try:
+        text = data.decode("utf-8")
+    except UnicodeDecodeError:
+        # 无法按文本处理（且 sniff_image_mime_type 也不会把这类内容识别成 SVG）
+        return data, []
+
+    removed: List[str] = []
+
+    text, count = _SVG_DANGEROUS_ELEMENT.subn("", text)
+    if count:
+        removed.append(f"危险元素 x{count}")
+
+    text, count = _SVG_LEFTOVER_TAG.subn("", text)
+    if count:
+        removed.append(f"残留标签 x{count}")
+
+    text, count = _SVG_EVENT_ATTRIBUTE.subn("", text)
+    if count:
+        removed.append(f"事件属性 x{count}")
+
+    text, count = _SVG_SCRIPT_URI.subn(r"\1\2#\2", text)
+    if count:
+        removed.append(f"伪协议链接 x{count}")
+
+    if not removed:
+        return data, []
+
+    return text.encode("utf-8"), removed
 
 
 class ImageRequest(BaseModel):
@@ -110,19 +242,4 @@ class ImageData:
     
     def get_file_extension(self) -> str:
         """根据 MIME 类型获取文件扩展名"""
-        if not self.mime_type:
-            return ".png"
-        
-        mime_lower = self.mime_type.lower()
-        if mime_lower in ["image/jpeg", "image/jpg"]:
-            return ".jpg"
-        elif mime_lower == "image/png":
-            return ".png"
-        elif mime_lower == "image/gif":
-            return ".gif"
-        elif mime_lower == "image/webp":
-            return ".webp"
-        elif mime_lower == "image/svg+xml":
-            return ".svg"
-        else:
-            return ".png"
+        return extension_for_mime(self.mime_type)
