@@ -130,8 +130,21 @@ import {
   ReloadOutlined
 } from '@ant-design/icons-vue'
 import { getStatistics } from '@/api/statisticsController'
-import * as echarts from 'echarts'
+// ECharts 按需引入：只注册本页实际用到的图表、组件与渲染器
+import * as echarts from 'echarts/core'
+import { BarChart, PieChart } from 'echarts/charts'
+import { GridComponent, LegendComponent, TooltipComponent } from 'echarts/components'
+import { CanvasRenderer } from 'echarts/renderers'
 import type { EChartsOption } from 'echarts'
+
+echarts.use([
+  BarChart,
+  PieChart,
+  GridComponent,
+  LegendComponent,
+  TooltipComponent,
+  CanvasRenderer,
+])
 
 const loading = ref(false)
 const stats = ref<API.StatisticsVO | null>(null)
